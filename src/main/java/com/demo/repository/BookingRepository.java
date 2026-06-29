@@ -1,44 +1,73 @@
 package com.demo.repository;
 
 import com.demo.entity.Booking;
+import com.demo.enums.BookingStatus;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
 
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Optional;
+import java.util.Set;
 
-@Repository
 public interface BookingRepository extends JpaRepository<Booking, Integer> {
 
-    List<Booking> findByUserId(Integer userId);
+    /**
+     * All active (HELD or CONFIRMED) bookings for a bus on a date.
+     * Used for seat availability calculation.
+     */
+    List<Booking> findByBusIdAndJourneyDateAndStatusIn(
+            Integer busId, LocalDate journeyDate, List<BookingStatus> statuses);
 
-    List<Booking> findByBusIdAndBookingDate(Integer busId, LocalDate bookingDate);
+    /**
+     * Count of occupied seats (for BusService's available seat count).
+     */
+    int countByBusIdAndJourneyDateAndStatusIn(
+            Integer busId, LocalDate journeyDate, List<BookingStatus> statuses);
 
-    @Query("SELECT b FROM Booking b WHERE b.busId = :busId AND b.bookingDate = :date " +
-           "AND (b.booked = true OR b.inProcess = true)")
-    List<Booking> findOccupiedSeats(
+    /**
+     * Seat lock check — is a specific seat already HELD or CONFIRMED?
+     */
+    boolean existsByBusIdAndJourneyDateAndSeatNumberAndStatusIn(
+            Integer busId, LocalDate journeyDate, Integer seatNumber, List<BookingStatus> statuses);
+
+    /**
+     * Used by admin views to see all bookings for a bus+date.
+     */
+    List<Booking> findByBusIdAndJourneyDate(Integer busId, LocalDate journeyDate);
+
+    @Query("""
+                SELECT COUNT(b) > 0 FROM Booking b
+                WHERE b.busId = :busId
+                  AND b.journeyDate = :journeyDate
+                  AND b.seatNumber = :seatNumber
+                  AND b.status IN :statuses
+                  AND b.boardingStopSequence < :alightingSeq
+                  AND b.alightingStopSequence > :boardingSeq
+            """)
+    boolean existsConflictingBooking(
             @Param("busId") Integer busId,
-            @Param("date") LocalDate date);
+            @Param("journeyDate") LocalDate journeyDate,
+            @Param("seatNumber") Integer seatNumber,
+            @Param("statuses") List<BookingStatus> statuses,
+            @Param("boardingSeq") Integer boardingSeq,
+            @Param("alightingSeq") Integer alightingSeq);
 
-    Optional<Booking> findByBusIdAndBookingDateAndSeatNo(Integer busId, LocalDate bookingDate, Integer seatNo);
 
-    @Query("SELECT b FROM Booking b WHERE b.inProcess = true AND b.expirationTime < :now")
-    List<Booking> findExpiredBookings(@Param("now") LocalDateTime now);
-
-    @Query("SELECT b FROM Booking b WHERE b.busId = :busId AND b.bookingDate = :date AND b.booked = true")
-    List<Booking> findConfirmedBookings(
+    // Fetch ALL conflicting seat numbers for a segment in one query
+    // (used to build the seat availability map efficiently)
+    @Query("""
+                SELECT b.seatNumber FROM Booking b
+                WHERE b.busId = :busId
+                  AND b.journeyDate = :journeyDate
+                  AND b.status IN :statuses
+                  AND b.boardingStopSequence < :alightingSeq
+                  AND b.alightingStopSequence > :boardingSeq
+            """)
+    Set<Integer> findOccupiedSeatNumbers(
             @Param("busId") Integer busId,
-            @Param("date") LocalDate date);
-
-    boolean existsByBusIdAndBookingDateAndSeatNoAndBookedTrue(
-            Integer busId, LocalDate bookingDate, Integer seatNo);
-
-    boolean existsByBusIdAndBookingDateAndSeatNoAndInProcessTrue(
-            Integer busId, LocalDate bookingDate, Integer seatNo);
-
-    List<Booking> findByIdIn(List<Integer> ids);
+            @Param("journeyDate") LocalDate journeyDate,
+            @Param("statuses") List<BookingStatus> statuses,
+            @Param("boardingSeq") Integer boardingSeq,
+            @Param("alightingSeq") Integer alightingSeq);
 }

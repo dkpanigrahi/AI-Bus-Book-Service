@@ -43,4 +43,18 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(ApiResponse.error("An unexpected error occurred", "INTERNAL_ERROR"));
     }
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleResourceNotFoundException(Exception ex) {
+        log.error("Unexpected error: {}", ex.getMessage(), ex);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error("An unexpected error occurred", "INTERNAL_ERROR"));
+    }
+
+    @ExceptionHandler(SeatUnavailableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleSeatUnavailableException(Exception ex) {
+        log.error("Unexpected error: {}", ex.getMessage(), ex);
+        return ResponseEntity.status(HttpStatus.UNAVAILABLE_FOR_LEGAL_REASONS)
+                .body(ApiResponse.error("An unexpected error occurred", "INTERNAL_ERROR"));
+    }
 }

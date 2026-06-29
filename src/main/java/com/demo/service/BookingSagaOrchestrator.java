@@ -1,162 +1,125 @@
 package com.demo.service;
 
-import com.demo.entity.Booking;
-import com.demo.events.BookingCancelledEvent;
-import com.demo.events.BookingCreatedEvent;
-import com.demo.events.NotificationEvent;
-import com.demo.events.PaymentCompletedEvent;
+import com.demo.entity.BookingGroup;
+import com.demo.events.*;
 import com.demo.kafka.BookingEventPublisher;
-import com.demo.repository.BookingRepository;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 /**
- * Saga Choreography Orchestrator for the booking flow.
+ * Saga Orchestrator — coordinates the booking lifecycle across services.
  *
- * Flow:
- *  1. BookingService.holdSeats()         → publishes BookingCreatedEvent
- *  2. PaymentService                     → listens, processes payment, publishes PaymentCompletedEvent
- *  3. BookingSagaOrchestrator            → listens for PaymentCompletedEvent:
- *       SUCCESS → confirm bookings → publish NotificationEvent (BOOKING_CONFIRMED)
- *       FAILURE → cancel bookings → publish NotificationEvent (PAYMENT_FAILED)
- *                                 → publish BookingCancelledEvent (compensation)
+ * Redesigned changes:
+ *  - Resolves BookingGroup by sagaEventId (not raw booking ID list)
+ *  - Delegates all state mutations to BookingService (single source of truth)
+ *  - Builds richer NotificationEvent with segment + seat breakdown
  */
 @Service
 @Slf4j
 public class BookingSagaOrchestrator {
 
-    @Autowired
-    private BookingRepository bookingRepository;
+    private final BookingService bookingService;
+    private final BookingEventPublisher eventPublisher;
 
-    @Autowired
-    private BookingEventPublisher eventPublisher;
+    public BookingSagaOrchestrator(@Lazy BookingService bookingService,
+                                   BookingEventPublisher eventPublisher) {
+        this.bookingService = bookingService;
+        this.eventPublisher = eventPublisher;
+    }
 
-    /**
-     * Step 1: Initiate SAGA after seats are held.
-     * Publishes BookingCreatedEvent to trigger Payment Service.
-     */
+    // ── Step 1: Initiate ──────────────────────────────────────────────────────
+
     public void initiateBookingSaga(BookingCreatedEvent event) {
-        log.info("=== SAGA STARTED === BookingCreatedEvent published. EventId: {}, BookingIds: {}",
-                event.getEventId(), event.getBookingId());
+        log.info("=== SAGA STARTED === eventId={} groupId={} seats={}",
+                event.getEventId(), event.getBookingGroupId(),
+                event.getSeats() != null ? event.getSeats().size() : 0);
         eventPublisher.publishBookingCreatedEvent(event);
     }
 
-    /**
-     * Step 3a: Handle payment success.
-     * Confirms all bookings and sends a confirmation notification.
-     */
-    @Transactional
+    // ── Step 3a: Payment success ──────────────────────────────────────────────
+
     public void handlePaymentSuccess(PaymentCompletedEvent event) {
-        log.info("=== SAGA STEP 3 - PAYMENT SUCCESS === EventId: {}, BookingIds: {}",
-                event.getEventId(), event.getBookingIds());
+        log.info("=== SAGA SUCCESS === eventId={} transactionId={}",
+                event.getEventId(), event.getTransactionId());
 
-        List<Booking> bookings = bookingRepository.findByIdIn(event.getBookingIds());
+        BookingGroup group = bookingService.confirmGroup(event.getEventId(), event.getTransactionId());
 
-        if (bookings.isEmpty()) {
-            log.warn("No bookings found for ids: {}", event.getBookingIds());
-            return;
-        }
-
-        // Confirm bookings
-        bookings.forEach(booking -> {
-            booking.setBooked(true);
-            booking.setInProcess(false);
-            booking.setExpirationTime(null);
-        });
-        bookingRepository.saveAll(bookings);
-
-        log.info("Bookings confirmed successfully for ids: {}", event.getBookingIds());
-
-        // Build and publish BOOKING_CONFIRMED notification
-        NotificationEvent notificationEvent = NotificationEvent.builder()
+        NotificationEvent notification = NotificationEvent.builder()
                 .eventId(UUID.randomUUID().toString())
                 .type("BOOKING_CONFIRMED")
-                .userId(event.getUserId())
-                .userEmail(event.getUserEmail())
-                .bookingIds(event.getBookingIds())
-                .passengerNames(event.getPassengerNames())
-                .seatNumbers(event.getSeatNumbers())
-                .journeyDate(event.getJourneyDate())
-                .transactionId(event.getTransactionId())
+                .userId(group.getUserId())
+                .userEmail(group.getUserEmail())
+                .bookingGroupId(group.getId())
+                .bookingIds(group.getBookings().stream().map(b -> b.getId()).toList())
                 .subject("Booking Confirmed – Your ticket is ready!")
-                .message(buildConfirmationMessage(event))
+                .message(buildConfirmationMessage(group, event.getTransactionId()))
                 .build();
 
-        eventPublisher.publishNotificationEvent(notificationEvent);
-
-        log.info("=== SAGA COMPLETED SUCCESSFULLY === EventId: {}", event.getEventId());
+        eventPublisher.publishNotificationEvent(notification);
+        log.info("=== SAGA COMPLETED SUCCESSFULLY === eventId={}", event.getEventId());
     }
 
-    /**
-     * Step 3b: Handle payment failure — compensation transaction.
-     * Cancels all held bookings and notifies the user.
-     */
-    @Transactional
+    // ── Step 3b: Payment failure — compensation ───────────────────────────────
+
     public void handlePaymentFailure(PaymentCompletedEvent event) {
-        log.warn("=== SAGA STEP 3 - PAYMENT FAILED - COMPENSATION === EventId: {}, BookingIds: {}",
-                event.getEventId(), event.getBookingIds());
+        log.warn("=== SAGA COMPENSATION === eventId={} reason={}",
+                event.getEventId(), event.getErrorMessage());
 
-        List<Booking> bookings = bookingRepository.findByIdIn(event.getBookingIds());
+        BookingGroup group = bookingService.cancelGroupByEventId(
+                event.getEventId(), "Payment failed: " + event.getErrorMessage());
 
-        if (bookings.isEmpty()) {
-            log.warn("No bookings found for compensation. Ids: {}", event.getBookingIds());
-            return;
-        }
-
-        // Compensation: release held seats
-        bookingRepository.deleteAll(bookings);
-        log.info("Compensation complete: {} bookings released for ids: {}",
-                bookings.size(), event.getBookingIds());
-
-        // Publish BookingCancelledEvent for any downstream cleanup
-        BookingCancelledEvent cancelledEvent = BookingCancelledEvent.builder()
+        // Downstream cleanup event
+        BookingCancelledEvent cancelEvent = BookingCancelledEvent.builder()
                 .eventId(UUID.randomUUID().toString())
-                .bookingIds(event.getBookingIds())
-                .userId(event.getUserId())
+                .sagaEventId(event.getEventId())
+                .bookingGroupId(group.getId())
+                .bookingIds(group.getBookings().stream().map(b -> b.getId()).toList())
+                .userId(group.getUserId())
+                .userEmail(group.getUserEmail())
                 .reason("Payment failed: " + event.getErrorMessage())
                 .build();
-        eventPublisher.publishBookingCancelledEvent(cancelledEvent);
+        eventPublisher.publishBookingCancelledEvent(cancelEvent);
 
-        // Notify user of payment failure
-        NotificationEvent notificationEvent = NotificationEvent.builder()
+        // Notify user
+        NotificationEvent notification = NotificationEvent.builder()
                 .eventId(UUID.randomUUID().toString())
                 .type("PAYMENT_FAILED")
-                .userId(event.getUserId())
-                .userEmail(event.getUserEmail())
-                .bookingIds(event.getBookingIds())
+                .userId(group.getUserId())
+                .userEmail(group.getUserEmail())
+                .bookingGroupId(group.getId())
                 .subject("Payment Failed – Booking Not Confirmed")
                 .message("We're sorry, your payment could not be processed. " +
-                         "Reason: " + event.getErrorMessage() +
-                         ". Your seats have been released. Please try again.")
+                        "Reason: " + event.getErrorMessage() +
+                        ". Your seats have been released. Please try again.")
                 .build();
+        eventPublisher.publishNotificationEvent(notification);
 
-        eventPublisher.publishNotificationEvent(notificationEvent);
-
-        log.warn("=== SAGA COMPENSATION COMPLETED === EventId: {}", event.getEventId());
+        log.warn("=== SAGA COMPENSATION COMPLETED === eventId={}", event.getEventId());
     }
 
-    private String buildConfirmationMessage(PaymentCompletedEvent event) {
+    // ── Private ───────────────────────────────────────────────────────────────
+
+    private String buildConfirmationMessage(BookingGroup group, String transactionId) {
         StringBuilder sb = new StringBuilder();
         sb.append("Your booking has been confirmed!\n\n");
-        sb.append("Transaction ID: ").append(event.getTransactionId()).append("\n");
-        sb.append("Journey Date: ").append(event.getJourneyDate()).append("\n");
-
-        if (event.getPassengerNames() != null && event.getSeatNumbers() != null) {
-            sb.append("Passengers:\n");
-            List<String> names = event.getPassengerNames();
-            List<Integer> seats = event.getSeatNumbers();
-            for (int i = 0; i < names.size(); i++) {
-                sb.append("  - ").append(names.get(i))
-                  .append(" (Seat: ").append(i < seats.size() ? seats.get(i) : "N/A").append(")\n");
-            }
-        }
-        sb.append("\nThank you for booking with us!");
+        sb.append("Transaction ID: ").append(transactionId).append("\n");
+        sb.append("Bus: ").append(group.getBusNo()).append("\n");
+        sb.append("Journey Date: ").append(group.getJourneyDate()).append("\n");
+        sb.append("From: ").append(group.getBoardingStopName())
+                .append("  →  To: ").append(group.getAlightingStopName()).append("\n\n");
+        sb.append("Passengers:\n");
+        group.getBookings().forEach(b ->
+                sb.append("  - ").append(b.getPassengerName())
+                        .append(" | Seat: ").append(b.getSeatLabel())
+                        .append(" (").append(b.getSeatType()).append(", ").append(b.getDeckLevel()).append(")")
+                        .append(" | ₹").append(b.getFinalPrice()).append("\n")
+        );
+        sb.append("\nTotal: ₹").append(group.getTotalAmount());
+        sb.append("\n\nThank you for booking with us!");
         return sb.toString();
     }
 }

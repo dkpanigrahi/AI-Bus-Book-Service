@@ -1,6 +1,7 @@
 package com.demo.client;
 
 import com.demo.dto.ApiResponse;
+import com.demo.dto.BusDetailDto;
 import com.demo.dto.BusDto;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.openfeign.FeignClient;
@@ -16,15 +17,16 @@ import org.springframework.web.bind.annotation.PathVariable;
 public interface BusServiceClient {
 
     @GetMapping("/api/buses/{id}")
-    ResponseEntity<ApiResponse<BusDto>> getBusById(@PathVariable("id") int id);
+    ResponseEntity<ApiResponse<BusDetailDto>> getBusById(@PathVariable("id") int id);
 
     @Component
-    @Slf4j
     class BusServiceFallback implements BusServiceClient {
 
+        private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(BusServiceFallback.class);
+
         @Override
-        public ResponseEntity<ApiResponse<BusDto>> getBusById(int id) {
-            log.warn("Fallback triggered for getBusById - busId: {}", id);
+        public ResponseEntity<ApiResponse<BusDetailDto>> getBusById(int id) {
+            log.warn("Fallback triggered for getBusById - busId "+id);
             return ResponseEntity.ok(ApiResponse.error("Bus service is temporarily unavailable"));
         }
     }

@@ -2,116 +2,127 @@ package com.demo.controller;
 
 import com.demo.dto.ApiResponse;
 import com.demo.dto.BookingDto;
+import com.demo.dto.BookingGroupDto;
 import com.demo.dto.SeatAvailabilityResponse;
-import com.demo.entity.Booking;
+import com.demo.dto.request.HoldSeatsRequest;
 import com.demo.service.BookingService;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.LocalDate;
 import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
 
+/**
+ * Redesigned BookingController.
+ *
+ * Changes vs original:
+ *  - POST /hold now accepts a typed HoldSeatsRequest (@Valid) instead of Map<String,Object>
+ *  - Group-level endpoints replace flat /bookings/{id} queries
+ *  - Cancel operates on the group (all seats cancel together)
+ *  - Seat availability endpoint unchanged (still called by BusService via Feign)
+ */
 @RestController
 @RequestMapping("/api/bookings")
+@RequiredArgsConstructor
 @Slf4j
 public class BookingController {
 
-    @Autowired
-    private BookingService bookingService;
+    private final BookingService bookingService;
+
+    // =========================================================================
+    //  HOLD — Saga entry point
+    // =========================================================================
 
     /**
-     * Hold seats and initiate the Saga booking flow.
-     * Body: { userId, busId, journeyDate, seatNumbers, passengerNames }
+     * Validates seats, computes per-seat prices, holds all seats in one
+     * BookingGroup, and publishes BookingCreatedEvent to trigger payment.
      */
     @PostMapping("/hold")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> holdSeats(
-            @RequestBody Map<String, Object> request,
-            @RequestHeader(value = "X-User-Id", required = false) String headerUserId) {
+    public ResponseEntity<ApiResponse<BookingGroupDto>> holdSeats(
+            @Validated @RequestBody HoldSeatsRequest request) {
 
-        Integer userId = Integer.valueOf(request.get("userId").toString());
-        Integer busId = Integer.valueOf(request.get("busId").toString());
-        String journeyDateStr = request.get("journeyDate").toString();
-        LocalDate journeyDate = LocalDate.parse(journeyDateStr);
+        log.info("POST /api/bookings/hold — userId={} busId={} date={} seats={}",
+                request.getUserId(), request.getBusId(), request.getJourneyDate(),
+                request.getPassengers().stream()
+                        .map(p -> p.getSeatNumber().toString()).toList());
 
-        @SuppressWarnings("unchecked")
-        List<Integer> seatNumbers = ((List<Object>) request.get("seatNumbers"))
-                .stream().map(o -> Integer.valueOf(o.toString())).collect(Collectors.toList());
+        BookingGroupDto group = bookingService.holdSeatsAndInitiateSaga(request);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success(
+                        "Seats held. Please complete payment within 10 minutes.", group));
+    }
 
-        @SuppressWarnings("unchecked")
-        List<String> passengerNames = (List<String>) request.get("passengerNames");
+    // =========================================================================
+    //  BOOKING GROUP QUERIES
+    // =========================================================================
 
-        log.info("Hold seats request - userId: {}, busId: {}, date: {}, seats: {}",
-                userId, busId, journeyDate, seatNumbers);
-
-        List<Integer> bookingIds = bookingService.holdSeatsAndInitiateSaga(
-                userId, busId, journeyDate, seatNumbers, passengerNames);
-
-        Map<String, Object> response = Map.of(
-                "bookingIds", bookingIds,
-                "status", "SEATS_HELD",
-                "message", "Seats held successfully. Complete payment to confirm.",
-                "expiresInMinutes", 10
-        );
-
-        return ResponseEntity.ok(ApiResponse.success("Seats held. Please complete payment.", response));
+    @GetMapping("/groups/{groupId}")
+    public ResponseEntity<ApiResponse<BookingGroupDto>> getGroupById(@PathVariable Integer groupId) {
+        log.info("GET /api/bookings/groups/{}", groupId);
+        return ResponseEntity.ok(ApiResponse.success(bookingService.getGroupById(groupId)));
     }
 
     @GetMapping("/user/{userId}")
-    public ResponseEntity<ApiResponse<List<BookingDto>>> getBookingsByUser(@PathVariable int userId) {
-        log.info("Fetching bookings for userId: {}", userId);
-        List<BookingDto> bookings = bookingService.getBookingsByUser(userId).stream()
-                .map(bookingService::mapToDto)
-                .collect(Collectors.toList());
-        return ResponseEntity.ok(ApiResponse.success(bookings));
+    public ResponseEntity<ApiResponse<List<BookingGroupDto>>> getBookingsByUser(
+            @PathVariable Integer userId) {
+        log.info("GET /api/bookings/user/{}", userId);
+        return ResponseEntity.ok(ApiResponse.success(bookingService.getGroupsByUser(userId)));
     }
 
-    @GetMapping("/{id}")
-    public ResponseEntity<ApiResponse<BookingDto>> getBookingById(@PathVariable int id) {
-        log.info("Fetching booking by id: {}", id);
-        Booking booking = bookingService.getBookingById(id);
-        return ResponseEntity.ok(ApiResponse.success(bookingService.mapToDto(booking)));
-    }
+    // =========================================================================
+    //  FLAT SEAT QUERIES (used by bus-side tools or admin views)
+    // =========================================================================
 
     @GetMapping("/bus/{busId}")
     public ResponseEntity<ApiResponse<List<BookingDto>>> getBookingsByBusAndDate(
-            @PathVariable int busId,
+            @PathVariable Integer busId,
             @RequestParam String date) {
-        log.info("Fetching bookings for busId: {}, date: {}", busId, date);
-        List<BookingDto> bookings = bookingService.getBookingsByBusAndDate(busId, date).stream()
-                .map(bookingService::mapToDto)
-                .collect(Collectors.toList());
-        return ResponseEntity.ok(ApiResponse.success(bookings));
+        log.info("GET /api/bookings/bus/{} date={}", busId, date);
+        return ResponseEntity.ok(
+                ApiResponse.success(bookingService.getBookingsByBusAndDate(busId, date)));
     }
 
-    @DeleteMapping("/{id}/cancel")
-    public ResponseEntity<ApiResponse<Void>> cancelBooking(
-            @PathVariable int id,
-            @RequestParam int userId) {
-        log.info("Cancel request for bookingId: {}, userId: {}", id, userId);
-        bookingService.cancelBooking(id, userId);
+    // =========================================================================
+    //  CANCEL
+    // =========================================================================
+
+    /**
+     * Cancels all seats in the group (user-initiated).
+     * Publishes BookingCancelledEvent for refund and notification.
+     */
+    @DeleteMapping("/groups/{groupId}/cancel")
+    public ResponseEntity<ApiResponse<Void>> cancelBookingGroup(
+            @PathVariable Integer groupId,
+            @RequestParam Integer userId) {
+        log.info("DELETE /api/bookings/groups/{}/cancel userId={}", groupId, userId);
+        bookingService.cancelBookingGroup(groupId, userId);
         return ResponseEntity.ok(ApiResponse.success("Booking cancelled successfully", null));
     }
 
-    // ─── Seat Availability (used by Bus Service via FeignClient) ──
+    // =========================================================================
+    //  SEAT AVAILABILITY  (called by BusService via FeignClient)
+    // =========================================================================
 
     @GetMapping("/seats/availability")
     public ResponseEntity<ApiResponse<SeatAvailabilityResponse>> getSeatAvailability(
-            @RequestParam int busId,
-            @RequestParam String date) {
-        log.info("Seat availability request - busId: {}, date: {}", busId, date);
-        SeatAvailabilityResponse availability = bookingService.getSeatAvailability(busId, date);
-        return ResponseEntity.ok(ApiResponse.success(availability));
+            @RequestParam Integer busId,
+            @RequestParam String date,
+            @RequestParam Integer boardingStopSequence,
+            @RequestParam Integer alightingStopSequence) {
+        log.info("GET /api/bookings/seats/availability busId={} date={}", busId, date);
+        return ResponseEntity.ok(
+                ApiResponse.success(bookingService
+                        .getSeatAvailability(busId, date,boardingStopSequence,alightingStopSequence)));
     }
 
     @GetMapping("/seats/booked-count")
     public ResponseEntity<ApiResponse<Integer>> getBookedSeatCount(
-            @RequestParam int busId,
+            @RequestParam Integer busId,
             @RequestParam String date) {
-        int count = bookingService.getBookedSeatCount(busId, date);
-        return ResponseEntity.ok(ApiResponse.success(count));
+        return ResponseEntity.ok(
+                ApiResponse.success(bookingService.getBookedSeatCount(busId, date)));
     }
 }
