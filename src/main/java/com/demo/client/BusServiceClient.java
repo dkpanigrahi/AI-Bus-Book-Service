@@ -16,7 +16,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 )
 public interface BusServiceClient {
 
-    @GetMapping("/api/buses/{id}")
+    @GetMapping("/api/buses/internal/{id}/detail")
     ResponseEntity<ApiResponse<BusDetailDto>> getBusById(@PathVariable("id") int id);
 
     @Component
